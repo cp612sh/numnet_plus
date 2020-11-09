@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any
-from tools import allennlp as util
+from collections import OrderedDict
 import torch.nn.functional as F
-from mspan_roberta_gcn.util import FFNLayer, GCN, ResidualGRU
+
+from tools import allennlp as util
 from tools.utils import DropEmAndF1
+from mspan_roberta_gcn.util import GCN, ResidualGRU, FFNLayer
+from .multispan_heads import multispan_heads_mapping, remove_substring_from_prediction
 
 
 def get_best_span(span_start_logits: torch.Tensor, span_end_logits: torch.Tensor) -> torch.Tensor:
@@ -33,8 +36,7 @@ def get_best_span(span_start_logits: torch.Tensor, span_end_logits: torch.Tensor
     # can recover the start and end indices from this flattened list using simple modular
     # arithmetic.
     # (batch_size, passage_length * passage_length)
-    # best_spans = valid_span_log_probs.view(batch_size, -1).argmax(-1)
-    _, best_spans = valid_span_log_probs.view(batch_size, -1).topk(20, dim=-1)
+    best_spans = valid_span_log_probs.view(batch_size, -1).argmax(-1)
 
     # (batch_size, 20)
     span_start_indices = best_spans // passage_length
@@ -43,21 +45,6 @@ def get_best_span(span_start_logits: torch.Tensor, span_end_logits: torch.Tensor
     # (batch_size, 20, 2)
     return torch.stack([span_start_indices, span_end_indices], dim=-1)
 
-def best_answers_extraction(best_spans, span_num, original_str, offsets, offset_start):
-    predicted_span = tuple(best_spans.detach().cpu().numpy())
-    predict_answers = []
-    predict_offsets = []
-    for i in range(20):
-        start_offset = offsets[predicted_span[i][0] - offset_start][0] if predicted_span[i][0] - offset_start < len(offsets) else offsets[-1][0]
-        end_offset = offsets[predicted_span[i][1] - offset_start][1] if predicted_span[i][1] - offset_start < len(offsets) else offsets[-1][1]
-        predict_answer = original_str[start_offset:end_offset]
-        predict_offset = (start_offset, end_offset)
-        if len(predict_answers) == 0 or all([len(set(item.split()) & set(predict_answer.split())) == 0 for item in predict_answers]):
-            predict_answers.append( predict_answer)
-            predict_offsets.append( predict_offset)
-        if len(predict_answers) >= span_num:
-            break
-    return predict_answers, predict_offsets
 
 def convert_number_to_str(number):
     if isinstance(number, int):
@@ -81,22 +68,49 @@ def convert_number_to_str(number):
 
     return num_str
 
+
 class NumericallyAugmentedBertNet(nn.Module):
+    """
+    This class augments the QANet model with some rudimentary numerical reasoning abilities, as
+    published in the original DROP paper.
+
+    The main idea here is that instead of just predicting a passage span after doing all of the
+    QANet modeling stuff, we add several different "answer abilities": predicting a span from the
+    question, predicting a count, or predicting an arithmetic expression.  Near the end of the
+    QANet model, we have a variable that predicts what kind of answer type we need, and each branch
+    has separate modeling logic to predict that answer type.  We then marginalize over all possible
+    ways of getting to the right answer through each of these answer types.
+    """
     def __init__(self,
                  bert,
                  hidden_size: int,
                  dropout_prob: float = 0.1,
                  answering_abilities: List[str] = None,
                  use_gcn: bool = False,
-                 gcn_steps: int = 1) -> None:
+                 gcn_steps: int = 1,
+                 unique_on_multispan: bool = True,
+                 multispan_head_name: str = "flexible_loss",
+                 multispan_generation_top_k: int = 0,
+                 multispan_prediction_beam_size: int = 1,
+                 multispan_use_prediction_beam_search: bool = False,
+                 multispan_use_bio_wordpiece_mask: bool = True,
+                 dont_add_substrings_to_ms: bool = True,
+                 trainning: bool = True,
+                 ) -> None:
         super(NumericallyAugmentedBertNet, self).__init__()
+        self.training = trainning
+        self.multispan_head_name = multispan_head_name
+        self.multispan_use_prediction_beam_search = multispan_use_prediction_beam_search
+        self.multispan_use_bio_wordpiece_mask = multispan_use_bio_wordpiece_mask
+        self._dont_add_substrings_to_ms = dont_add_substrings_to_ms
+
         self.use_gcn = use_gcn
         self.bert = bert
         modeling_out_dim = hidden_size
         self._drop_metrics = DropEmAndF1()
         if answering_abilities is None:
             self.answering_abilities = ["passage_span_extraction", "question_span_extraction",
-                                        "addition_subtraction", "counting"]
+                                        "addition_subtraction", "counting", "multiple_spans"]
         else:
             self.answering_abilities = answering_abilities
 
@@ -117,6 +131,20 @@ class NumericallyAugmentedBertNet(nn.Module):
             self._counting_index = self.answering_abilities.index("counting")
             self._count_number_predictor = FFNLayer(5 * hidden_size, hidden_size, 10, dropout_prob)
 
+        # add multiple span prediction from https://github.com/eladsegal/project-NLP-AML
+        if "multiple_spans" in self.answering_abilities:
+            if self.multispan_head_name == "flexible_loss":
+                self.multispan_head = multispan_heads_mapping[multispan_head_name](modeling_out_dim,
+                                                                                   generation_top_k=multispan_generation_top_k,
+                                                                                   prediction_beam_size=multispan_prediction_beam_size)
+            else:
+                self.multispan_head = multispan_heads_mapping[multispan_head_name](modeling_out_dim)
+
+            self._multispan_module = self.multispan_head.module
+            self._multispan_log_likelihood = self.multispan_head.log_likelihood
+            self._multispan_prediction = self.multispan_head.prediction
+            self._unique_on_multispan = unique_on_multispan
+
         self._dropout = torch.nn.Dropout(p=dropout_prob)
 
         if self.use_gcn:
@@ -125,6 +153,7 @@ class NumericallyAugmentedBertNet(nn.Module):
             self._gcn_input_proj = nn.Linear(node_dim * 2, node_dim)
             self._gcn = GCN(node_dim=node_dim, iteration_steps=gcn_steps)
             self._iteration_steps = gcn_steps
+            print('gcn iteration_steps=%d' % self._iteration_steps, flush=True)
             self._proj_ln = nn.LayerNorm(node_dim)
             self._proj_ln0 = nn.LayerNorm(node_dim)
             self._proj_ln1 = nn.LayerNorm(node_dim)
@@ -137,9 +166,6 @@ class NumericallyAugmentedBertNet(nn.Module):
         self._proj_sequence_g0 = FFNLayer(hidden_size, hidden_size, 1, dropout_prob)
         self._proj_sequence_g1 = FFNLayer(hidden_size, hidden_size, 1, dropout_prob)
         self._proj_sequence_g2 = FFNLayer(hidden_size, hidden_size, 1, dropout_prob)
-
-        # span num extraction
-        self._proj_span_num = FFNLayer( 3 * hidden_size, hidden_size, 9, dropout_prob)
 
     def forward(self,  # type: ignore
                 input_ids: torch.LongTensor,
@@ -155,10 +181,13 @@ class NumericallyAugmentedBertNet(nn.Module):
                 answer_as_question_spans: torch.LongTensor = None,
                 answer_as_add_sub_expressions: torch.LongTensor = None,
                 answer_as_counts: torch.LongTensor = None,
-                span_num: torch.LongTensor = None,
+                answer_as_text_to_disjoint_bios: torch.LongTensor = None,
+                answer_as_list_of_bios: torch.LongTensor = None,
+                span_bio_labels: torch.LongTensor = None,
+                bio_wordpiece_mask: torch.LongTensor = None,
+                is_bio_mask: torch.LongTensor = None,
                 metadata: List[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
 
-        # sequence_output, _, other_sequence_output = self.bert(input_ids, input_segments, input_mask)
         outputs = self.bert(input_ids, attention_mask=input_mask, token_type_ids=input_segments)
         sequence_output = outputs[0]
         sequence_output_list = [ item for item in outputs[2][-4:] ]
@@ -189,12 +218,12 @@ class NumericallyAugmentedBertNet(nn.Module):
             new_graph_mask = new_graph_mask.long()
             all_number_mask = torch.cat((number_mask, question_number_mask), dim=-1)
             new_graph_mask = all_number_mask.unsqueeze(1) * all_number_mask.unsqueeze(-1) * new_graph_mask
-
             # iteration
             d_node, q_node, d_node_weight, _ = self._gcn(d_node=encoded_numbers, q_node=question_encoded_number,
                 d_node_mask=number_mask, q_node_mask=question_number_mask, graph=new_graph_mask)
             gcn_info_vec = torch.zeros((batch_size, sequence_alg.size(1) + 1, sequence_output_list[-1].size(-1)),
                                        dtype=torch.float, device=d_node.device)
+
             clamped_number_indices = util.replace_masked_values(real_number_indices, number_mask,
                                                                 gcn_info_vec.size(1) - 1)
             gcn_info_vec.scatter_(1, clamped_number_indices.unsqueeze(-1).expand(-1, -1, d_node.size(-1)), d_node)
@@ -231,6 +260,7 @@ class NumericallyAugmentedBertNet(nn.Module):
             answer_ability_logits = self._answer_ability_predictor(torch.cat([passage_h2, question_h2, sequence_output[:, 0]], 1))
             answer_ability_log_probs = F.log_softmax(answer_ability_logits, -1)
             best_answer_ability = torch.argmax(answer_ability_log_probs, 1)
+            top_two_answer_abilities = torch.topk(answer_ability_log_probs, k=2, dim=1)
 
         real_number_indices = number_indices.squeeze(-1) - 1
         number_mask = (real_number_indices > -1).long()
@@ -271,12 +301,6 @@ class NumericallyAugmentedBertNet(nn.Module):
             # Shape: (batch_size, passage_length)
             sequence_span_end_logits = self._span_end_predictor(sequence_for_span_end).squeeze(-1)
             # Shape: (batch_size, passage_length)
-
-            # span number prediction
-            span_num_logits = self._proj_span_num(torch.cat([passage_h2, question_h2, sequence_output[:, 0]], dim=1))
-            span_num_log_probs = torch.nn.functional.log_softmax(span_num_logits, -1)
-
-            best_span_number = torch.argmax(span_num_log_probs, dim=-1)
 
             if "passage_span_extraction" in self.answering_abilities:
                 passage_span_start_log_probs = util.masked_log_softmax(sequence_span_start_logits, passage_mask)
@@ -326,6 +350,17 @@ class NumericallyAugmentedBertNet(nn.Module):
             if len(self.answering_abilities) > 1:
                 best_combination_log_prob += answer_ability_log_probs[:, self._addition_subtraction_index]
 
+        # add multiple span prediction
+        if bio_wordpiece_mask is None or not self.multispan_use_bio_wordpiece_mask:
+            multispan_mask = input_mask
+        else:
+            multispan_mask = input_mask * bio_wordpiece_mask
+        if "multiple_spans" in self.answering_abilities:
+            if self.multispan_head_name == "flexible_loss":
+                multispan_log_probs, multispan_logits = self._multispan_module(sequence_output, seq_mask=multispan_mask)
+            else:
+                multispan_log_probs, multispan_logits = self._multispan_module(sequence_output)
+
         output_dict = {}
 
         # If answer is given, compute the loss.
@@ -358,13 +393,7 @@ class NumericallyAugmentedBertNet(nn.Module):
                     # Shape: (batch_size, )
                     log_marginal_likelihood_for_passage_span = util.logsumexp(log_likelihood_for_passage_spans)
 
-                    # span log probabilities
-                    log_likelihood_for_passage_span_nums = torch.gather(span_num_log_probs, 1, span_num)
-                    log_likelihood_for_passage_span_nums = util.replace_masked_values(log_likelihood_for_passage_span_nums,
-                                                                                      gold_passage_span_mask[:, :1], -1e7)
-                    log_marginal_likelihood_for_passage_span_nums = util.logsumexp(log_likelihood_for_passage_span_nums)
-                    log_marginal_likelihood_list.append(log_marginal_likelihood_for_passage_span +
-                                                        log_marginal_likelihood_for_passage_span_nums)
+                    log_marginal_likelihood_list.append(log_marginal_likelihood_for_passage_span)
 
                 elif answering_ability == "question_span_extraction":
                     # Shape: (batch_size, # of answer spans)
@@ -392,10 +421,7 @@ class NumericallyAugmentedBertNet(nn.Module):
                     log_marginal_likelihood_for_question_span = util.logsumexp(log_likelihood_for_question_spans)
 
                     # question multi span prediction
-                    log_likelihood_for_question_span_nums = torch.gather(span_num_log_probs, 1, span_num)
-                    log_marginal_likelihood_for_question_span_nums = util.logsumexp(log_likelihood_for_question_span_nums)
-                    log_marginal_likelihood_list.append(log_marginal_likelihood_for_question_span +
-                                                        log_marginal_likelihood_for_question_span_nums)
+                    log_marginal_likelihood_list.append(log_marginal_likelihood_for_question_span)
 
                 elif answering_ability == "addition_subtraction":
                     # The padded add-sub combinations use 0 as the signs for all numbers, and we mask them here.
@@ -433,9 +459,27 @@ class NumericallyAugmentedBertNet(nn.Module):
                     log_marginal_likelihood_for_count = util.logsumexp(log_likelihood_for_counts)
                     log_marginal_likelihood_list.append(log_marginal_likelihood_for_count)
 
+                elif answering_ability == "multiple_spans":
+                    if self.multispan_head_name == "flexible_loss":
+                        log_marginal_likelihood_for_multispan = \
+                            self._multispan_log_likelihood(answer_as_text_to_disjoint_bios,
+                                                           answer_as_list_of_bios,
+                                                           span_bio_labels,
+                                                           multispan_log_probs,
+                                                           multispan_logits,
+                                                           multispan_mask,
+                                                           bio_wordpiece_mask,
+                                                           is_bio_mask)
+                    else:
+                        log_marginal_likelihood_for_multispan = \
+                            self._multispan_log_likelihood(span_bio_labels,
+                                                           multispan_log_probs,
+                                                           multispan_mask,
+                                                           is_bio_mask,
+                                                           logits=multispan_logits)
+                    log_marginal_likelihood_list.append(log_marginal_likelihood_for_multispan)
                 else:
                     raise ValueError(f"Unsupported answering ability: {answering_ability}")
-            # print(log_marginal_likelihood_list)
             if len(self.answering_abilities) > 1:
                 # Add the ability probabilities if there are more than one abilities
                 all_log_marginal_likelihoods = torch.stack(log_marginal_likelihood_list, dim=-1)
@@ -445,73 +489,109 @@ class NumericallyAugmentedBertNet(nn.Module):
                 marginal_log_likelihood = log_marginal_likelihood_list[0]
             output_dict["loss"] = - marginal_log_likelihood.mean()
 
-        if metadata is not None:
-            output_dict["question_id"] = []
-            output_dict["answer"] = []
-            for i in range(batch_size):
-                if len(self.answering_abilities) > 1:
-                    predicted_ability_str = self.answering_abilities[best_answer_ability[i].detach().cpu().numpy()]
-                else:
-                    predicted_ability_str = self.answering_abilities[0]
+        with torch.no_grad():
+            best_answer_ability = best_answer_ability.detach().cpu().numpy()
+            if metadata is not None:
+                output_dict["question_id"] = []
+                output_dict["answer"] = []
+                i = 0
+                while i < batch_size:
+                    if len(self.answering_abilities) > 1:
+                        answer_index = best_answer_ability[i]
+                        predicted_ability_str = self.answering_abilities[answer_index]
+                    else:
+                        predicted_ability_str = self.answering_abilities[0]
 
-                answer_json: Dict[str, Any] = {}
+                    answer_json: Dict[str, Any] = {}
 
-                question_start = 1
-                passage_start = len(metadata[i]["question_tokens"]) + 2
-                # We did not consider multi-mention answers here
-                if predicted_ability_str == "passage_span_extraction":
-                    answer_json["answer_type"] = "passage_span"
-                    passage_str = metadata[i]['original_passage']
-                    offsets = metadata[i]['passage_token_offsets']
-                    predicted_answer, predicted_spans = best_answers_extraction(best_passage_span[i], best_span_number[i], passage_str, offsets, passage_start)
-                    answer_json["value"] = predicted_answer
-                    answer_json["spans"] = predicted_spans
-                elif predicted_ability_str == "question_span_extraction":
-                    answer_json["answer_type"] = "question_span"
-                    question_str = metadata[i]['original_question']
-                    offsets = metadata[i]['question_token_offsets']
-                    predicted_answer, predicted_spans = best_answers_extraction(best_question_span[i], best_span_number[i], question_str, offsets, question_start)
-                    answer_json["value"] = predicted_answer
-                    answer_json["spans"] = predicted_spans
-                elif predicted_ability_str == "addition_subtraction":
-                    answer_json["answer_type"] = "arithmetic"
-                    original_numbers = metadata[i]['original_numbers']
-                    sign_remap = {0: 0, 1: 1, 2: -1}
-                    predicted_signs = [sign_remap[it] for it in best_signs_for_numbers[i].detach().cpu().numpy()]
-                    result = sum([sign * number for sign, number in zip(predicted_signs, original_numbers)])
-                    predicted_answer = convert_number_to_str(result)
-                    offsets = metadata[i]['passage_token_offsets']
-                    number_indices = metadata[i]['number_indices']
-                    number_positions = [offsets[index - 1] for index in number_indices]
-                    answer_json['numbers'] = []
-                    for offset, value, sign in zip(number_positions, original_numbers, predicted_signs):
-                        answer_json['numbers'].append({'span': offset, 'value': value, 'sign': sign})
-                    if number_indices[-1] == -1:
-                        # There is a dummy 0 number at position -1 added in some cases; we are
-                        # removing that here.
-                        answer_json["numbers"].pop()
-                    answer_json["value"] = result
-                    answer_json['number_sign_log_probs'] = number_sign_log_probs[i, :, :].detach().cpu().numpy()
+                    question_start = 1
+                    passage_start = len(metadata[i]["question_tokens"]) + 2
+                    # We did not consider multi-mention answers here
+                    if predicted_ability_str == "passage_span_extraction":
+                        answer_json["answer_type"] = "passage_span"
+                        passage_str = metadata[i]['original_passage']
+                        offsets = metadata[i]['passage_token_offsets']
+                        predicted_span = tuple(best_passage_span[i].detach().cpu().numpy())
+                        start_offset = offsets[predicted_span[0] - passage_start][0]
+                        end_offset = offsets[predicted_span[1] - passage_start][1]
+                        predicted_answer = passage_str[start_offset:end_offset]
+                        answer_json["value"] = predicted_answer
+                        answer_json["spans"] = [(start_offset, end_offset)]
+                    elif predicted_ability_str == "question_span_extraction":
+                        answer_json["answer_type"] = "question_span"
+                        question_str = metadata[i]['original_question']
+                        offsets = metadata[i]['question_token_offsets']
+                        predicted_span = tuple(best_question_span[i].detach().cpu().numpy())
+                        start_offset = offsets[predicted_span[0] - question_start][0]
+                        end_offset = offsets[predicted_span[1] - question_start][1]
+                        predicted_answer = question_str[start_offset:end_offset]
+                        answer_json["value"] = predicted_answer
+                        answer_json["spans"] = [(start_offset, end_offset)]
+                    elif predicted_ability_str == "addition_subtraction":  # plus_minus combination answer
+                        answer_json["answer_type"] = "arithmetic"
+                        original_numbers = metadata[i]['original_numbers']
+                        sign_remap = {0: 0, 1: 1, 2: -1}
+                        predicted_signs = [sign_remap[it] for it in best_signs_for_numbers[i].detach().cpu().numpy()]
+                        result = sum([sign * number for sign, number in zip(predicted_signs, original_numbers)])
+                        predicted_answer = convert_number_to_str(result)
 
-                elif predicted_ability_str == "counting":
-                    answer_json["answer_type"] = "count"
-                    predicted_count = best_count_number[i].detach().cpu().numpy()
-                    predicted_answer = str(predicted_count)
-                    answer_json["count"] = predicted_count
-                else:
-                    raise ValueError(f"Unsupported answer ability: {predicted_ability_str}")
+                        offsets = metadata[i]['passage_token_offsets']
+                        number_indices = metadata[i]['number_indices']
+                        number_positions = [offsets[index - 1] for index in number_indices]
+                        answer_json['numbers'] = []
+                        for offset, value, sign in zip(number_positions, original_numbers, predicted_signs):
+                            answer_json['numbers'].append({'span': offset, 'value': value, 'sign': sign})
+                        if number_indices[-1] == -1:
+                            # There is a dummy 0 number at position -1 added in some cases; we are
+                            # removing that here.
+                            answer_json["numbers"].pop()
+                        answer_json["value"] = result
+                        answer_json['number_sign_log_probs'] = number_sign_log_probs[i, :, :].detach().cpu().numpy()
+                    elif predicted_ability_str == "counting":
+                        answer_json["answer_type"] = "count"
+                        predicted_count = best_count_number[i].detach().cpu().numpy()
+                        predicted_answer = str(predicted_count)
+                        answer_json["count"] = predicted_count
+                    elif predicted_ability_str == "multiple_spans":
+                        passage_str = metadata[i]["original_passage"]
+                        question_str = metadata[i]['original_question']
+                        qp_tokens = metadata[i]["question_passage_tokens"]
+                        answer_json["answer_type"] = "multiple_spans"
+                        if self.multispan_head_name == "flexible_loss":
+                            answer_json["value"], answer_json["spans"], invalid_spans = \
+                                self._multispan_prediction(multispan_log_probs[i], multispan_logits[i], qp_tokens,
+                                                           passage_str,
+                                                           question_str,
+                                                           multispan_mask[i], bio_wordpiece_mask[i],
+                                                           self.multispan_use_prediction_beam_search and not self.training)
+                        else:
+                            answer_json["value"], answer_json["spans"], invalid_spans = \
+                                self._multispan_prediction(multispan_log_probs[i], multispan_logits[i], qp_tokens,
+                                                           passage_str,
+                                                           question_str,
+                                                           multispan_mask[i])
+                        if self._unique_on_multispan:
+                            answer_json["value"] = list(OrderedDict.fromkeys(answer_json["value"]))
 
-                answer_json["predicted_answer"] = predicted_answer
-                output_dict["question_id"].append(metadata[i]["question_id"])
-                output_dict["answer"].append(answer_json)
-                answer_annotations = metadata[i].get('answer_annotations', [])
-                if answer_annotations:
-                    self._drop_metrics(predicted_answer, answer_annotations)
+                            if self._dont_add_substrings_to_ms:
+                                answer_json["value"] = remove_substring_from_prediction(answer_json["value"])
 
-            if self.use_gcn:
-                output_dict['clamped_number_indices'] = clamped_number_indices
-                output_dict['node_weight'] = d_node_weight
-        return output_dict
+                        if len(answer_json["value"]) == 0:
+                            best_answer_ability[i] = top_two_answer_abilities[1][i][1]
+                            continue
+                        predicted_answer = answer_json["value"]
+                    else:
+                        raise ValueError(f"Unsupported answer ability: {predicted_ability_str}")
+
+                    answer_json["predicted_answer"] = predicted_answer
+                    output_dict["question_id"].append(metadata[i]["question_id"])
+                    output_dict["answer"].append(answer_json)
+                    answer_annotations = metadata[i].get('answer_annotations', [])
+                    if answer_annotations:
+                        self._drop_metrics(predicted_answer, answer_annotations)
+
+                    i += 1
+            return output_dict
 
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         exact_match, f1_score = self._drop_metrics.get_metric(reset)

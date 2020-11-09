@@ -1,25 +1,22 @@
-import os
-import pickle
 import torch
 import random
+from .token import Token
 
 class DropBatchGen(object):
-    def __init__(self, args, data_mode, tokenizer, padding_idx=1):
+    def __init__(self, args, tokenizer, data, padding_idx=1):
         self.args = args
         self.cls_idx = tokenizer.convert_tokens_to_ids(tokenizer.cls_token)
         self.sep_idx = tokenizer.convert_tokens_to_ids(tokenizer.sep_token)
         self.padding_idx = padding_idx
-        self.is_train = data_mode == "train"
+        self.is_train = False
         self.vocab_size = len(tokenizer)
-        dpath = "cached_roberta_{}.pkl".format(data_mode)
-        with open(os.path.join(args.data_dir, dpath), "rb") as f:
-            print("Load data from {}.".format(dpath))
-            data = pickle.load(f)
-
         all_data = []
         for item in data:
             question_tokens = tokenizer.convert_tokens_to_ids(item["question_tokens"])
             passage_tokens = tokenizer.convert_tokens_to_ids(item["passage_tokens"])
+            question_passage_tokens = [ Token(text=item[0], idx=item[1][0], edx=item[1][1] ) for item in zip(item["question_passage_tokens"],
+                    [(0,0)] + item["question_token_offsets"] + [(0,0)]+ item["passage_token_offsets"] + [(0, 0)])]
+            item["question_passage_tokens"] = question_passage_tokens
             all_data.append((question_tokens, passage_tokens, item))
 
         print("Load data size {}.".format(len(all_data)))
@@ -60,8 +57,8 @@ class DropBatchGen(object):
             max_num_len = max([1] + [len(item["number_indices"]) for item in metas])
             max_qnum_len = max([1] + [len(item["question_number_indices"]) for item in metas])
 
-            max_pans_choice = min(8, max([1] + [len(item["answer_passage_spans"]) for item in metas]))
-            max_qans_choice = min(8, max([1] + [len(item["answer_question_spans"]) for item in metas]))
+            max_pans_choice = max([1] + [len(item["answer_passage_spans"]) for item in metas])
+            max_qans_choice = max([1] + [len(item["answer_question_spans"]) for item in metas])
             max_sign_choice = max([1] + [len(item["signs_for_add_sub_expressions"]) for item in metas])
 
             # qa input.
@@ -83,11 +80,23 @@ class DropBatchGen(object):
             answer_as_add_sub_expressions = torch.LongTensor(bsz, max_sign_choice, max_num_len).fill_(0)
             answer_as_counts = torch.LongTensor(bsz).fill_(-1)
 
-            # answer span number
-            span_num = torch.LongTensor(bsz).fill_(0)
+            # multiple span label
+            max_text_answers = max([1] + [0 if len(metas[i]["multi_span"]) < 1 else
+                                       len(metas[i]["multi_span"][1])
+                                       for i in range(bsz)])
+            max_answer_spans = max([1] + [0 if len(metas[i]["multi_span"]) < 1 else
+                                       max([len(item) for item in metas[i]["multi_span"][1]])
+                                       for i in range(bsz)])
+            max_correct_sequences = max([1] + [0 if len(metas[i]["multi_span"]) < 1 else
+                                            len(metas[i]["multi_span"][2])
+                                            for i in range(bsz)])
+            is_bio_mask = torch.LongTensor(bsz).fill_(0)
+            bio_wordpiece_mask = torch.LongTensor(bsz, max_seq_len).fill_(0)
+            answer_as_text_to_disjoint_bios = torch.LongTensor(bsz, max_text_answers, max_answer_spans, max_seq_len).fill_(0)
+            answer_as_list_of_bios = torch.LongTensor(bsz, max_correct_sequences, max_seq_len).fill_(0)
+            span_bio_labels = torch.LongTensor(bsz, max_seq_len).fill_(0)
 
             for i in range(bsz):
-                span_num[i] = min(8, len(metas[i]["answer_texts"]))
                 q_len = len(q_tokens[i])
                 p_len = len(p_tokens[i])
                 # input and their mask
@@ -132,6 +141,18 @@ class DropBatchGen(object):
                 if len(metas[i]["counts"]) > 0:
                     answer_as_counts[i] = metas[i]["counts"][0]
 
+                # add multi span prediction
+                cur_seq_len = q_len + p_len + 3
+                bio_wordpiece_mask[i, :cur_seq_len] = torch.LongTensor(metas[i]["wordpiece_mask"][:cur_seq_len])
+                if len(metas[i]["multi_span"]) > 0:
+                    is_bio_mask[i] = metas[i]["multi_span"][0]
+                    span_bio_labels[i, :cur_seq_len] = torch.LongTensor(metas[i]["multi_span"][-1][:cur_seq_len])
+                    for j in range(len(metas[i]["multi_span"][1])):
+                        for k in range(len(metas[i]["multi_span"][1][j])):
+                            answer_as_text_to_disjoint_bios[i, j, k, :cur_seq_len] = torch.LongTensor(metas[i]["multi_span"][1][j][k][:cur_seq_len])
+                    for j in range(len(metas[i]["multi_span"][2])):
+                        answer_as_list_of_bios[i, j, :cur_seq_len] = torch.LongTensor(metas[i]["multi_span"][2][j][:cur_seq_len])
+
             out_batch = {"input_ids": input_ids, "input_mask": input_mask, "input_segments": input_segments,
                          "passage_mask": passage_mask, "question_mask": question_mask, "number_indices": number_indices,
                          "passage_number_order": passage_number_order,
@@ -140,7 +161,12 @@ class DropBatchGen(object):
                          "answer_as_passage_spans": answer_as_passage_spans,
                          "answer_as_question_spans": answer_as_question_spans,
                          "answer_as_add_sub_expressions": answer_as_add_sub_expressions,
-                         "answer_as_counts": answer_as_counts.unsqueeze(1), "span_num": span_num.unsqueeze(1),
+                         "answer_as_counts": answer_as_counts.unsqueeze(1),
+                         "answer_as_text_to_disjoint_bios": answer_as_text_to_disjoint_bios,
+                         "answer_as_list_of_bios": answer_as_list_of_bios,
+                         "span_bio_labels": span_bio_labels,
+                         "is_bio_mask": is_bio_mask,
+                         "bio_wordpiece_mask": bio_wordpiece_mask,
                          "metadata": metas}
             if self.args.cuda:
                 for k in out_batch.keys():
